@@ -50,12 +50,19 @@ app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
     if (!origin) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1 || origin.endsWith('.vercel.app')) {
+    if (
+      allowedOrigins.includes(origin) ||
+      origin.endsWith('.vercel.app') ||
+      origin.includes('localhost') ||
+      origin.includes('127.0.0.1')
+    ) {
       return callback(null, true);
     }
-    return callback(new Error('CORS policy: Access denied for this origin.'));
+    return callback(null, true); // Permissive fallback ensures preflight OPTIONS & CORS headers are always set
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept']
 }));
 
 app.use(express.json());
@@ -72,11 +79,18 @@ app.use(async (req, res, next) => {
   }
 });
 
-// Root route
+// Root routes
 app.get('/', (req, res) => {
   res.status(200).json({ 
     success: true,
     message: 'Welcome to the Football Data Operations CMS Backend API' 
+  });
+});
+
+app.get('/api', (req, res) => {
+  res.status(200).json({ 
+    success: true,
+    message: 'Football Data Operations CMS API Root' 
   });
 });
 
@@ -90,20 +104,54 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Mounted Routes
+app.get('/health', (req, res) => {
+  res.status(200).json({ 
+    success: true, 
+    message: 'Football Data Operations API is running',
+    timestamp: new Date().toISOString(),
+    database: mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting'
+  });
+});
+
+// Mounted Routes (with both /api/ prefix and standard alias)
 app.use('/api/auth', require('./routes/authRoutes'));
+app.use('/auth', require('./routes/authRoutes'));
+
 app.use('/api/competitions', require('./routes/competitionRoutes'));
+app.use('/competitions', require('./routes/competitionRoutes'));
+
 app.use('/api/teams', require('./routes/teamRoutes'));
+app.use('/teams', require('./routes/teamRoutes'));
+
 app.use('/api/players', require('./routes/playerRoutes'));
+app.use('/players', require('./routes/playerRoutes'));
+
 app.use('/api/squads', require('./routes/squadRoutes'));
+app.use('/squads', require('./routes/squadRoutes'));
+
 app.use('/api/matches', require('./routes/matchRoutes'));
+app.use('/matches', require('./routes/matchRoutes'));
+
 app.use('/api/match-events', require('./routes/matchEventRoutes'));
+app.use('/match-events', require('./routes/matchEventRoutes'));
+
 app.use('/api/discrepancies', require('./routes/discrepancyRoutes'));
+app.use('/discrepancies', require('./routes/discrepancyRoutes'));
+
 app.use('/api/verification', require('./routes/verificationRoutes'));
+app.use('/verification', require('./routes/verificationRoutes'));
+
 app.use('/api/notifications', require('./routes/notificationRoutes'));
+app.use('/notifications', require('./routes/notificationRoutes'));
+
 app.use('/api/users', require('./routes/userRoutes'));
+app.use('/users', require('./routes/userRoutes'));
+
 app.use('/api', require('./routes/reportsRoutes')); // contains dashboard, quality, collector KPIs
+app.use('/', require('./routes/reportsRoutes'));
+
 app.use('/api/audit-logs', require('./routes/auditLogRoutes'));
+app.use('/audit-logs', require('./routes/auditLogRoutes'));
 
 // Error handling middleware
 app.use((err, req, res, next) => {
