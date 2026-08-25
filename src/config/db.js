@@ -22,10 +22,11 @@ const connectDB = async () => {
       serverSelectionTimeoutMS: 5000
     });
     cachedConnection = conn;
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
+    console.log(`[DB] MongoDB Connected to host: ${conn.connection.host}`);
+    console.log(`[DB] Database name: ${conn.connection.name}`);
     return conn;
   } catch (error) {
-    console.error(`MongoDB Connection Error: ${error.message}`);
+    console.error(`[DB] MongoDB Connection Error: ${error.message}`);
     if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
       process.exit(1);
     }

@@ -20,28 +20,77 @@ const loginUser = async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const normalizedEmail = email ? email.trim().toLowerCase() : '';
-    console.log('[AUTH] LOGIN ATTEMPT');
-    
+    console.log('[LOGIN] request received');
+    console.log('[LOGIN] email received:', !!email);
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        code: 'MISSING_FIELDS',
+        message: 'Please provide both email and password'
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
     const user = await User.findOne({ email: normalizedEmail });
     const userFound = !!user;
-    console.log('[AUTH] LOGIN USER FOUND:', userFound);
+    console.log('[LOGIN] user found:', userFound);
 
     if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+      return res.status(401).json({
+        success: false,
+        code: 'USER_NOT_FOUND',
+        message: 'Invalid email or password'
+      });
     }
+
+    const userStatus = user.status ? user.status.toLowerCase() : 'inactive';
+    const isUserActive = userStatus === 'active';
+    console.log('[LOGIN] user active:', isUserActive);
+
+    if (!isUserActive) {
+      return res.status(401).json({
+        success: false,
+        code: 'USER_INACTIVE',
+        message: 'Account is inactive. Please contact an administrator.'
+      });
+    }
+
+    const isHashValid = user.password && (user.password.startsWith('$2a$') || user.password.startsWith('$2b$'));
+    console.log('[LOGIN] password hash exists:', !!user.password);
+    console.log('[LOGIN] password hash format valid:', !!isHashValid);
 
     const passwordMatch = await user.matchPassword(password);
-    console.log('[AUTH] LOGIN PASSWORD MATCH:', passwordMatch);
+    console.log('[LOGIN] password comparison completed: true');
+    console.log('[LOGIN] password matched:', passwordMatch);
 
-    if (!passwordMatch || user.status !== 'active') {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    if (!passwordMatch) {
+      return res.status(401).json({
+        success: false,
+        code: 'INVALID_PASSWORD',
+        message: 'Invalid email or password'
+      });
     }
 
-    console.log('[AUTH] LOGIN SUCCESS for role:', user.role);
+    const jwtSecretAvailable = !!process.env.JWT_SECRET;
+    console.log('[LOGIN] JWT secret available:', jwtSecretAvailable);
 
-    const token = generateToken(user._id, user.role);
-    const refreshToken = generateRefreshToken(user._id, user.role);
+    if (!jwtSecretAvailable) {
+      console.error('[LOGIN] JWT_SECRET is missing in environment variables');
+      return res.status(500).json({
+        success: false,
+        code: 'JWT_CONFIGURATION_ERROR',
+        message: 'Authentication configuration error'
+      });
+    }
+
+    const normalizedRole = user.role ? user.role.toLowerCase() : 'collector';
+    console.log('[LOGIN] user role:', normalizedRole.toUpperCase());
+
+    const token = generateToken(user._id, normalizedRole);
+    const refreshToken = generateRefreshToken(user._id, normalizedRole);
+    console.log('[LOGIN] JWT generated: true');
+    console.log('[LOGIN] login successful');
 
     user.refreshToken = refreshToken;
     await user.save();
@@ -55,12 +104,16 @@ const loginUser = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        role: user.role
+        role: normalizedRole
       }
     });
   } catch (error) {
-    console.error('[AUTH] LOGIN ERROR:', error.message);
-    res.status(500).json({ message: error.message });
+    console.error('[LOGIN] ERROR:', error.message);
+    res.status(500).json({
+      success: false,
+      code: 'SERVER_ERROR',
+      message: error.message
+    });
   }
 };
 
