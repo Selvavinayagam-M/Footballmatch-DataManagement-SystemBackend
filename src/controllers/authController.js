@@ -20,32 +20,46 @@ const loginUser = async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    const normalizedEmail = email.trim().toLowerCase();
+    const normalizedEmail = email ? email.trim().toLowerCase() : '';
+    console.log('[AUTH] LOGIN ATTEMPT');
+    
     const user = await User.findOne({ email: normalizedEmail });
+    const userFound = !!user;
+    console.log('[AUTH] LOGIN USER FOUND:', userFound);
 
-    if (user && user.status === 'active' && (await user.matchPassword(password))) {
-      const token = generateToken(user._id, user.role);
-      const refreshToken = generateRefreshToken(user._id, user.role);
-
-      user.refreshToken = refreshToken;
-      await user.save();
-
-      res.json({
-        success: true,
-        message: 'Login successful',
-        token,
-        refreshToken,
-        user: {
-          id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role
-        }
-      });
-    } else {
-      res.status(401).json({ success: false, message: 'Invalid email or password' });
+    if (!user) {
+      return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
+
+    const passwordMatch = await user.matchPassword(password);
+    console.log('[AUTH] LOGIN PASSWORD MATCH:', passwordMatch);
+
+    if (!passwordMatch || user.status !== 'active') {
+      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+    }
+
+    console.log('[AUTH] LOGIN SUCCESS for role:', user.role);
+
+    const token = generateToken(user._id, user.role);
+    const refreshToken = generateRefreshToken(user._id, user.role);
+
+    user.refreshToken = refreshToken;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Login successful',
+      token,
+      refreshToken,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role
+      }
+    });
   } catch (error) {
+    console.error('[AUTH] LOGIN ERROR:', error.message);
     res.status(500).json({ message: error.message });
   }
 };
