@@ -7,23 +7,23 @@ const seedUsers = async () => {
 
   if (!mongoUri) {
     console.error('❌ Error: MONGODB_URI environment variable is missing.');
-    console.error('Please set MONGODB_URI before running this seed script.');
+    console.error('Please provide MONGODB_URI in your environment or backend/.env before running this script.');
     process.exit(1);
   }
 
   try {
-    console.log('[AUTH] Connecting to MongoDB...');
+    console.log('[SEED] Connecting to MongoDB...');
     await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 10000
     });
 
-    console.log('[AUTH] Database connected');
-    console.log(`[AUTH] Database name: ${mongoose.connection.name}`);
-    console.log('[AUTH] Users collection: users\n');
+    const dbName = mongoose.connection.name;
+    console.log(`[SEED] Database: ${dbName}`);
+    console.log(`[SEED] Users collection: users\n`);
 
     const usersToSeed = [
       {
-        displayName: 'Admin',
+        displayName: 'ADMIN',
         name: 'Admin User',
         email: 'admin@example.com',
         role: 'admin',
@@ -31,7 +31,7 @@ const seedUsers = async () => {
         password: process.env.ADMIN_SEED_PASSWORD || process.env.SEED_PASSWORD || 'password123'
       },
       {
-        displayName: 'Collector',
+        displayName: 'COLLECTOR',
         name: 'Data Collector',
         email: 'collector@example.com',
         role: 'collector',
@@ -53,14 +53,15 @@ const seedUsers = async () => {
       let user = await User.findOne({ email: normalizedEmail });
 
       if (user) {
-        // Safe update: ensure active status and correct role
+        // Idempotent check: ensure active and valid role
         user.name = userData.name;
         user.role = userData.role;
         user.status = userData.status;
-        user.password = userData.password; // Mongoose pre-save hook hashes if modified
+        user.password = userData.password; // Mongoose pre-save hook re-hashes if modified
         await user.save();
+        console.log(`[SEED] ${normalizedEmail} → exists (role: ${user.role.toUpperCase()})`);
       } else {
-        // Create new user
+        // Create missing user
         user = await User.create({
           name: userData.name,
           email: normalizedEmail,
@@ -68,21 +69,21 @@ const seedUsers = async () => {
           role: userData.role,
           status: userData.status
         });
+        console.log(`[SEED] ${normalizedEmail} → created (role: ${user.role.toUpperCase()})`);
       }
 
-      // Verify user existence and password hashing match
-      const verified = await User.findOne({ email: normalizedEmail });
-      const passwordMatches = verified ? await verified.matchPassword(userData.password) : false;
+      // Verify user existence and password comparison
+      const verifiedUser = await User.findOne({ email: normalizedEmail });
+      const passwordMatch = verifiedUser ? await verifiedUser.matchPassword(userData.password) : false;
 
-      console.log(`[AUTH] ${userData.displayName} user exists: ${!!verified}`);
-      console.log(`[AUTH] ${userData.displayName} role: ${verified?.role?.toUpperCase()}`);
-      console.log(`[AUTH] ${userData.displayName} active status: ${verified?.status === 'active'}`);
-      console.log(`[AUTH] ${userData.displayName} password hash verified: ${passwordMatches}\n`);
+      if (!verifiedUser || !passwordMatch) {
+        console.error(`❌ [SEED ERROR] Failed to verify user ${normalizedEmail}`);
+      }
     }
 
-    const totalCount = await User.countDocuments();
-    console.log(`[AUTH] Total users in collection: ${totalCount}`);
-    console.log('[AUTH] Production user seeding verified successfully.');
+    const totalUsers = await User.countDocuments();
+    console.log(`\n[SEED] Total users count in "${dbName}.users": ${totalUsers}`);
+    console.log('[SEED] User seeding completed successfully.');
 
     await mongoose.connection.close();
     process.exit(0);
