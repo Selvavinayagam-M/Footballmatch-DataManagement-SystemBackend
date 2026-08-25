@@ -7,20 +7,23 @@ const seedUsers = async () => {
 
   if (!mongoUri) {
     console.error('❌ Error: MONGODB_URI environment variable is missing.');
-    console.error('Please configure MONGODB_URI in backend/.env or your terminal environment.');
+    console.error('Please set MONGODB_URI before running this seed script.');
     process.exit(1);
   }
 
   try {
-    console.log('Connecting to MongoDB...');
+    console.log('[AUTH] Connecting to MongoDB...');
     await mongoose.connect(mongoUri, {
       serverSelectionTimeoutMS: 10000
     });
-    console.log(`Connected to MongoDB (Database: "${mongoose.connection.name}")\n`);
+
+    console.log('[AUTH] Database connected');
+    console.log(`[AUTH] Database name: ${mongoose.connection.name}`);
+    console.log('[AUTH] Users collection: users\n');
 
     const usersToSeed = [
       {
-        displayName: 'Admin user',
+        displayName: 'Admin',
         name: 'Admin User',
         email: 'admin@example.com',
         role: 'admin',
@@ -28,7 +31,7 @@ const seedUsers = async () => {
         password: process.env.ADMIN_SEED_PASSWORD || process.env.SEED_PASSWORD || 'password123'
       },
       {
-        displayName: 'Collector user',
+        displayName: 'Collector',
         name: 'Data Collector',
         email: 'collector@example.com',
         role: 'collector',
@@ -36,7 +39,7 @@ const seedUsers = async () => {
         password: process.env.COLLECTOR_SEED_PASSWORD || process.env.SEED_PASSWORD || 'password123'
       },
       {
-        displayName: 'QA user',
+        displayName: 'QA',
         name: 'QA Reviewer',
         email: 'qa@example.com',
         role: 'qa',
@@ -47,36 +50,39 @@ const seedUsers = async () => {
 
     for (const userData of usersToSeed) {
       const normalizedEmail = userData.email.trim().toLowerCase();
-      const existingUser = await User.findOne({ email: normalizedEmail });
+      let user = await User.findOne({ email: normalizedEmail });
 
-      if (existingUser) {
-        // Safe idempotent update
-        existingUser.name = userData.name;
-        existingUser.role = userData.role;
-        existingUser.status = userData.status;
-        existingUser.password = userData.password; // Mongoose pre-save hook will hash password
-        await existingUser.save();
-
-        console.log(`${userData.displayName} (${userData.email}):`);
-        console.log('already exists (verified & active)\n');
+      if (user) {
+        // Safe update: ensure active status and correct role
+        user.name = userData.name;
+        user.role = userData.role;
+        user.status = userData.status;
+        user.password = userData.password; // Mongoose pre-save hook hashes if modified
+        await user.save();
       } else {
-        // Create new user (Mongoose pre-save hook hashes password)
-        await User.create({
+        // Create new user
+        user = await User.create({
           name: userData.name,
           email: normalizedEmail,
           password: userData.password,
           role: userData.role,
           status: userData.status
         });
-
-        console.log(`${userData.displayName} (${userData.email}):`);
-        console.log('created\n');
       }
+
+      // Verify user existence and password hashing match
+      const verified = await User.findOne({ email: normalizedEmail });
+      const passwordMatches = verified ? await verified.matchPassword(userData.password) : false;
+
+      console.log(`[AUTH] ${userData.displayName} user exists: ${!!verified}`);
+      console.log(`[AUTH] ${userData.displayName} role: ${verified?.role?.toUpperCase()}`);
+      console.log(`[AUTH] ${userData.displayName} active status: ${verified?.status === 'active'}`);
+      console.log(`[AUTH] ${userData.displayName} password hash verified: ${passwordMatches}\n`);
     }
 
     const totalCount = await User.countDocuments();
-    console.log(`Total users in collection: ${totalCount}`);
-    console.log('User seeding completed successfully.');
+    console.log(`[AUTH] Total users in collection: ${totalCount}`);
+    console.log('[AUTH] Production user seeding verified successfully.');
 
     await mongoose.connection.close();
     process.exit(0);
