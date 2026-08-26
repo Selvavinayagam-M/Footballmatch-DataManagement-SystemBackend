@@ -7,5 +7,6 @@ router.post('/login', loginUser);
 router.post('/refresh', refreshToken);
 router.post('/logout', protect, logoutUser);
 router.get('/profile', protect, getUserProfile);
+router.get('/me', protect, getUserProfile);
 
 module.exports = router;

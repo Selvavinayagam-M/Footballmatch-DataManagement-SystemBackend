@@ -1,11 +1,12 @@
 const Squad = require('../models/Squad');
 const Player = require('../models/Player');
 const Match = require('../models/Match');
+const Team = require('../models/Team');
 const AuditLog = require('../models/AuditLog');
 
-const validateSquadPlayers = (startingXI, substitutes) => {
+const validateSquadPlayers = async (startingXI, substitutes, teamId = null) => {
   if (!startingXI || startingXI.length !== 11) {
-    return `Starting XI must have exactly 11 players.`;
+    return `Starting XI must have exactly 11 players. You provided ${startingXI ? startingXI.length : 0}.`;
   }
   
   const startingIds = startingXI.map(id => id.toString());
@@ -15,6 +16,10 @@ const validateSquadPlayers = (startingXI, substitutes) => {
   }
 
   if (substitutes && substitutes.length > 0) {
+    if (substitutes.length > 9) {
+      return 'Substitutes cannot exceed 9 players.';
+    }
+
     const subIds = substitutes.map(id => id.toString());
     const uniqueSubs = new Set(subIds);
     if (uniqueSubs.size !== subIds.length) {
@@ -26,10 +31,27 @@ const validateSquadPlayers = (startingXI, substitutes) => {
       return 'A player cannot be in both Starting XI and Substitutes.';
     }
   }
+
+  // Cross-reference player existence and team affiliation
+  if (teamId) {
+    const allIds = [...startingIds, ...(substitutes ? substitutes.map(s => s.toString()) : [])];
+    const playersInDb = await Player.find({ _id: { $in: allIds } });
+    if (playersInDb.length !== allIds.length) {
+      return 'One or more selected players do not exist in the database.';
+    }
+    for (const p of playersInDb) {
+      if (p.team && p.team.toString() !== teamId.toString()) {
+        return `Player ${p.displayName} does not belong to the selected team.`;
+      }
+    }
+  }
   
   return null;
 };
 
+// @desc    Get all match squads
+// @route   GET /api/squads
+// @access  Private
 const getSquads = async (req, res) => {
   try {
     const query = {};
@@ -46,7 +68,7 @@ const getSquads = async (req, res) => {
           { path: 'competition', select: 'name' }
         ]
       })
-      .populate('team', 'name shortName logo')
+      .populate('team', 'name shortName logo country')
       .populate('startingXI', 'displayName position jerseyNumber team')
       .populate('substitutes', 'displayName position jerseyNumber team')
       .populate('checkedBy', 'name email role')
@@ -59,6 +81,9 @@ const getSquads = async (req, res) => {
   }
 };
 
+// @desc    Get squad by ID
+// @route   GET /api/squads/:id
+// @access  Private
 const getSquadById = async (req, res) => {
   try {
     const squad = await Squad.findById(req.params.id)
@@ -70,7 +95,7 @@ const getSquadById = async (req, res) => {
           { path: 'competition', select: 'name' }
         ]
       })
-      .populate('team', 'name shortName logo')
+      .populate('team', 'name shortName logo country')
       .populate('startingXI', 'displayName position jerseyNumber team')
       .populate('substitutes', 'displayName position jerseyNumber team')
       .populate('checkedBy', 'name email role')
@@ -83,11 +108,29 @@ const getSquadById = async (req, res) => {
   }
 };
 
+// @desc    Create squad
+// @route   POST /api/squads
+// @access  Private (Admin, Collector)
 const createSquad = async (req, res) => {
   try {
     const { match, team, startingXI, substitutes } = req.body;
     
-    const errorMsg = validateSquadPlayers(startingXI, substitutes);
+    if (!match || !team) {
+      return res.status(400).json({ success: false, message: 'Match and Team are required' });
+    }
+
+    const matchDoc = await Match.findById(match);
+    if (!matchDoc) {
+      return res.status(404).json({ success: false, message: 'Match not found' });
+    }
+
+    const homeTeamId = matchDoc.homeTeam.toString();
+    const awayTeamId = matchDoc.awayTeam.toString();
+    if (team.toString() !== homeTeamId && team.toString() !== awayTeamId) {
+      return res.status(400).json({ success: false, message: 'Selected team is not playing in this match' });
+    }
+
+    const errorMsg = await validateSquadPlayers(startingXI, substitutes, team);
     if (errorMsg) return res.status(400).json({ success: false, message: errorMsg });
     
     // Check if squad already exists for this match and team
@@ -100,55 +143,104 @@ const createSquad = async (req, res) => {
       match,
       team,
       startingXI,
-      substitutes,
+      substitutes: substitutes || [],
       createdBy: req.user._id,
       status: 'Pending'
     });
 
     const createdSquad = await squad.save();
-    res.status(201).json({ success: true, data: createdSquad });
+
+    // Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Created',
+        entityType: 'Squad',
+        entityId: createdSquad._id,
+        newValue: { match, team, startingCount: startingXI.length }
+      });
+    }
+
+    res.status(201).json({ success: true, data: createdSquad, squad: createdSquad });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
   }
 };
 
+// @desc    Update squad
+// @route   PUT /api/squads/:id
+// @access  Private (Admin, Collector)
 const updateSquad = async (req, res) => {
   try {
+    const squad = await Squad.findById(req.params.id);
+    if (!squad) {
+      return res.status(404).json({ success: false, message: 'Squad not found' });
+    }
+
     const { startingXI, substitutes, status } = req.body;
 
     if (startingXI) {
-      const errorMsg = validateSquadPlayers(startingXI, substitutes || []);
+      const errorMsg = await validateSquadPlayers(startingXI, substitutes || [], squad.team);
       if (errorMsg) return res.status(400).json({ success: false, message: errorMsg });
     }
 
-    const squad = await Squad.findById(req.params.id);
-    if (squad) {
-      if (startingXI) squad.startingXI = startingXI;
-      if (substitutes) squad.substitutes = substitutes;
-      if (status) squad.status = status;
-      
-      const updatedSquad = await squad.save();
-      res.json({ success: true, data: updatedSquad });
-    } else {
-      res.status(404).json({ success: false, message: 'Squad not found' });
+    const oldValue = squad.toObject();
+
+    if (startingXI) squad.startingXI = startingXI;
+    if (substitutes) squad.substitutes = substitutes;
+    if (status) squad.status = status;
+    
+    const updatedSquad = await squad.save();
+
+    // Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Updated',
+        entityType: 'Squad',
+        entityId: updatedSquad._id,
+        oldValue: { status: oldValue.status },
+        newValue: { status: updatedSquad.status }
+      });
     }
+
+    res.json({ success: true, data: updatedSquad, squad: updatedSquad });
   } catch (error) {
     res.status(400).json({ success: false, message: error.message });
   }
 };
 
+// @desc    Delete squad
+// @route   DELETE /api/squads/:id
+// @access  Private/Admin
 const deleteSquad = async (req, res) => {
   try {
     const squad = await Squad.findById(req.params.id);
     if (!squad) return res.status(404).json({ success: false, message: 'Squad not found' });
     
+    const oldValue = squad.toObject();
     await squad.deleteOne();
+
+    // Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Deleted',
+        entityType: 'Squad',
+        entityId: squad._id,
+        oldValue: { match: oldValue.match, team: oldValue.team }
+      });
+    }
+
     res.json({ success: true, message: 'Squad deleted successfully' });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
 };
 
+// @desc    Run automated 7-rule squad check
+// @route   POST /api/squads/:id/check
+// @access  Private (Admin, QA, Collector)
 const runSquadCheck = async (req, res) => {
   try {
     const squad = await Squad.findById(req.params.id)
@@ -174,8 +266,10 @@ const runSquadCheck = async (req, res) => {
       issues.push(`Starting XI has only ${startingCount} player${startingCount === 1 ? '' : 's'}. Must be exactly 11.`);
     }
 
-    // 3. Validate Starting XI Players (Existence, Duplicates, Team Belonging)
+    // 3. Validate Starting XI Players (Existence, Duplicates, Team Belonging, Goalkeeper)
     const startIds = new Set();
+    let hasGoalkeeper = false;
+
     if (squad.startingXI) {
       for (const p of squad.startingXI) {
         if (!p) {
@@ -187,10 +281,18 @@ const runSquadCheck = async (req, res) => {
         }
         startIds.add(p._id.toString());
         
-        if (p.team.toString() !== squad.team._id.toString()) {
+        if (p.position === 'Goalkeeper') {
+          hasGoalkeeper = true;
+        }
+
+        if (p.team && p.team.toString() !== squad.team._id.toString()) {
           issues.push(`Player ${p.displayName} does not belong to ${squad.team.name}.`);
         }
       }
+    }
+
+    if (startingCount === 11 && !hasGoalkeeper) {
+      issues.push('Starting XI roster must include at least one Goalkeeper.');
     }
 
     // 4. Validate Substitutes (Limit, Duplicates, Overlap, Team Belonging)
@@ -214,7 +316,7 @@ const runSquadCheck = async (req, res) => {
           issues.push(`Player ${p.displayName} appears in both Starting XI and substitutes.`);
         }
         
-        if (p.team.toString() !== squad.team._id.toString()) {
+        if (p.team && p.team.toString() !== squad.team._id.toString()) {
           issues.push(`Substitute player ${p.displayName} does not belong to ${squad.team.name}.`);
         }
       }
@@ -242,14 +344,16 @@ const runSquadCheck = async (req, res) => {
     await squad.save();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Verified',
-      entityType: 'Squad',
-      entityId: squad._id,
-      oldValue: { status: 'Pending' },
-      newValue: { status: 'Verified', checkedAt: squad.checkedAt }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Verified',
+        entityType: 'Squad',
+        entityId: squad._id,
+        oldValue: { status: 'Pending' },
+        newValue: { status: 'Verified', checkedAt: squad.checkedAt }
+      });
+    }
     
     res.json({ 
       success: true, 
@@ -265,6 +369,9 @@ const runSquadCheck = async (req, res) => {
   }
 };
 
+// @desc    Request correction
+// @route   POST /api/squads/:id/request-correction
+// @access  Private (Admin, QA)
 const requestCorrection = async (req, res) => {
   try {
     const squad = await Squad.findById(req.params.id);
@@ -278,14 +385,16 @@ const requestCorrection = async (req, res) => {
     await squad.save();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Rejected',
-      entityType: 'Squad',
-      entityId: squad._id,
-      oldValue: { status: squad.status },
-      newValue: { status: 'Correction Requested', notes }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Rejected',
+        entityType: 'Squad',
+        entityId: squad._id,
+        oldValue: { status: squad.status },
+        newValue: { status: 'Correction Requested', notes }
+      });
+    }
 
     res.json({
       success: true,
@@ -297,6 +406,9 @@ const requestCorrection = async (req, res) => {
   }
 };
 
+// @desc    Verify squad
+// @route   POST /api/squads/:id/verify
+// @access  Private (Admin, QA)
 const verifySquad = async (req, res) => {
   try {
     const squad = await Squad.findById(req.params.id);
@@ -309,14 +421,16 @@ const verifySquad = async (req, res) => {
     await squad.save();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Verified',
-      entityType: 'Squad',
-      entityId: squad._id,
-      oldValue: null,
-      newValue: { status: 'Verified' }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Verified',
+        entityType: 'Squad',
+        entityId: squad._id,
+        oldValue: null,
+        newValue: { status: 'Verified' }
+      });
+    }
 
     res.json({ success: true, message: 'Squad verified successfully by QA.', squad });
   } catch (error) {

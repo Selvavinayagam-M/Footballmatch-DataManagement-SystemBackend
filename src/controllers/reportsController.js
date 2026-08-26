@@ -6,13 +6,14 @@ const Competition = require('../models/Competition');
 const Team = require('../models/Team');
 const Squad = require('../models/Squad');
 const User = require('../models/User');
+const AuditLog = require('../models/AuditLog');
 
 const getDashboardStats = async (req, res) => {
   try {
     const role = req.user.role;
     const userId = req.user._id;
     const today = new Date();
-    today.setHours(0,0,0,0);
+    today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
@@ -20,16 +21,22 @@ const getDashboardStats = async (req, res) => {
       const totalCompetitions = await Competition.countDocuments();
       const totalTeams = await Team.countDocuments();
       const totalPlayers = await Player.countDocuments();
+      const totalMatches = await Match.countDocuments();
       const matchesToday = await Match.countDocuments({ scheduledDate: { $gte: today, $lt: tomorrow } });
       const liveMatches = await Match.countDocuments({ status: 'Live' });
       const completedMatches = await Match.countDocuments({ status: { $in: ['Full Time', 'Finished'] } });
       const pendingQA = await Match.countDocuments({ coverageStatus: 'Needs Review' });
       const openDiscrepancies = await Discrepancy.countDocuments({ status: 'Open' });
       const resolvedDiscrepancies = await Discrepancy.countDocuments({ status: 'Resolved' });
+      const totalDiscrepancies = await Discrepancy.countDocuments();
       
-      const totalDiscrepancies = openDiscrepancies + resolvedDiscrepancies + await Discrepancy.countDocuments({ status: 'Closed' });
-      const overallAccuracy = totalDiscrepancies === 0 ? 100 : Math.max(0, Math.round(100 - (openDiscrepancies / totalDiscrepancies * 10)));
-      const coverageCompletion = completedMatches === 0 ? 0 : Math.round((completedMatches / (matchesToday || 1)) * 100);
+      const overallAccuracy = totalDiscrepancies === 0 
+        ? 100 
+        : Math.max(0, Math.min(100, Math.round(100 - (openDiscrepancies / totalDiscrepancies * 100))));
+      
+      const coverageCompletion = totalMatches === 0 
+        ? 100 
+        : Math.min(100, Math.round((completedMatches / totalMatches) * 100));
 
       const matchesByStatus = await Match.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]);
       const verificationStatus = await Match.aggregate([{ $group: { _id: '$coverageStatus', count: { $sum: 1 } } }]);
@@ -39,7 +46,7 @@ const getDashboardStats = async (req, res) => {
       for (let i = 6; i >= 0; i--) {
         const d = new Date();
         d.setDate(d.getDate() - i);
-        d.setHours(0,0,0,0);
+        d.setHours(0, 0, 0, 0);
         const nextDay = new Date(d);
         nextDay.setDate(nextDay.getDate() + 1);
         const completed = await Match.countDocuments({ updatedAt: { $gte: d, $lt: nextDay }, status: { $in: ['Full Time', 'Finished'] } });
@@ -56,22 +63,31 @@ const getDashboardStats = async (req, res) => {
         { $limit: 5 }
       ]);
 
+      const recentActivity = await AuditLog.find({})
+        .populate('user', 'name role')
+        .sort({ timestamp: -1, createdAt: -1 })
+        .limit(6);
+
       return res.json({
-        totalCompetitions, totalTeams, totalPlayers, matchesToday, liveMatches, completedMatches,
+        totalCompetitions, totalTeams, totalPlayers, totalMatches, matchesToday, liveMatches, completedMatches,
         pendingQA, openDiscrepancies, resolvedDiscrepancies, overallAccuracy, coverageCompletion,
-        matchesByStatus, verificationStatus, discrepanciesBySeverity, dailyDataCollection, collectorPerformance
+        matchesByStatus, verificationStatus, discrepanciesBySeverity, dailyDataCollection, collectorPerformance,
+        recentActivity
       });
     } 
     
     else if (role === 'collector') {
       const myAssignedMatches = await Match.countDocuments({ dataCollector: userId });
-      const matchesToday = await Match.countDocuments({ scheduledDate: { $gte: today, $lt: tomorrow } });
-      const liveMatches = await Match.countDocuments({ status: 'Live' });
+      const matchesToday = await Match.countDocuments({ scheduledDate: { $gte: today, $lt: tomorrow }, dataCollector: userId });
+      const liveMatches = await Match.countDocuments({ dataCollector: userId, status: 'Live' });
       const pendingDataEntry = await Match.countDocuments({ dataCollector: userId, coverageStatus: 'In Progress' });
       const completedMatches = await Match.countDocuments({ dataCollector: userId, status: { $in: ['Full Time', 'Finished'] } });
       const myOpenDiscrepancies = await Discrepancy.countDocuments({ reportedBy: userId, status: 'Open' });
-      const myAccuracy = 98;
-      const myCompletionRate = myAssignedMatches === 0 ? 100 : Math.round((completedMatches / myAssignedMatches) * 100);
+      
+      const myApproved = await Match.countDocuments({ dataCollector: userId, coverageStatus: 'Approved' });
+      const myReviewed = await Match.countDocuments({ dataCollector: userId, coverageStatus: { $in: ['Approved', 'Correction Required'] } });
+      const myAccuracy = myReviewed === 0 ? 100 : Math.round((myApproved / myReviewed) * 100);
+      const myCompletionRate = myAssignedMatches === 0 ? 100 : Math.min(100, Math.round((completedMatches / myAssignedMatches) * 100));
 
       const myFixtures = await Match.find({ dataCollector: userId })
         .populate('competition', 'name')
@@ -90,11 +106,13 @@ const getDashboardStats = async (req, res) => {
       const pendingVerification = await Match.countDocuments({ coverageStatus: 'Needs Review' });
       const correctionRequired = await Match.countDocuments({ coverageStatus: 'Correction Required' });
       const openDiscrepancies = await Discrepancy.countDocuments({ status: 'Open' });
-      const squadsAwaitingCheck = await Match.countDocuments({ coverageStatus: 'Needs Review' });
+      const squadsAwaitingCheck = await Squad.countDocuments({ status: { $in: ['Pending', 'Mismatch'] } });
       const matchesAwaitingQA = pendingVerification;
       const verifiedToday = await Match.countDocuments({ coverageStatus: 'Approved', updatedAt: { $gte: today } });
       const rejectedToday = await Match.countDocuments({ coverageStatus: 'Correction Required', updatedAt: { $gte: today } });
-      const qualityAccuracy = 99;
+      
+      const totalQAHandled = verifiedToday + rejectedToday;
+      const qualityAccuracy = totalQAHandled === 0 ? 100 : Math.round((verifiedToday / totalQAHandled) * 100);
 
       const pendingQATable = await Match.find({ coverageStatus: 'Needs Review' })
         .populate('dataCollector', 'name')
@@ -285,14 +303,12 @@ const getCollectorPerformance = async (req, res) => {
     const role = req.user.role;
     const userId = req.user._id;
 
-    // QA role cannot access Collector KPIs unless explicitly authorized (or admin/collector)
     if (role === 'qa') {
       return res.status(403).json({ message: 'QA role is not authorized to access Collector KPI management.' });
     }
 
     const { preset, startDate, endDate } = req.query;
 
-    // Date filtering
     let start = null;
     let end = new Date();
     end.setHours(23, 59, 59, 999);
@@ -323,7 +339,6 @@ const getCollectorPerformance = async (req, res) => {
     const matchDateFilter = start ? { scheduledDate: { $gte: start, $lte: end } } : {};
     const dateFilter = start ? { createdAt: { $gte: start, $lte: end } } : {};
 
-    // Determine target users to evaluate
     let targetUsers = [];
     if (role === 'admin') {
       targetUsers = await User.find({ role: { $in: ['collector', 'admin'] } }).select('_id name email role');
@@ -384,12 +399,10 @@ const getCollectorPerformance = async (req, res) => {
         status: 'Resolved'
       });
 
-      // Accuracy = Correct Verified Records / Total Verified Records × 100
       const accuracyPercentage = recordsEntered === 0 
         ? 100 
         : Math.min(100, Math.max(0, Math.round(((recordsEntered - (discrepanciesRaised - discrepanciesResolved)) / (recordsEntered || 1)) * 100)));
 
-      // Completion = Completed Matches / Assigned Matches × 100
       const completionPercentage = matchesAssigned === 0 
         ? 100 
         : Math.round((matchesCompleted / matchesAssigned) * 100);
@@ -415,7 +428,6 @@ const getCollectorPerformance = async (req, res) => {
       });
     }
 
-    // Chart Data for Performance Comparisons
     const collectorAccuracy = collectors.map(c => ({ name: c.collectorName, accuracy: c.accuracyPercentage }));
     const collectorCompletion = collectors.map(c => ({ name: c.collectorName, completion: c.completionPercentage }));
     const recordsCollected = collectors.map(c => ({ name: c.collectorName, records: c.recordsEntered, verified: c.recordsVerified }));

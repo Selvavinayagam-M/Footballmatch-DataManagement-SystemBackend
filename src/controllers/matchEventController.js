@@ -12,10 +12,11 @@ const recalculateMatchScore = async (matchId) => {
   let awayScore = 0;
 
   for (const event of events) {
-    if (['Goal', 'Penalty'].includes(event.eventType)) {
+    const type = event.type || event.eventType;
+    if (['Goal', 'Penalty'].includes(type)) {
       if (event.team?.toString() === match.homeTeam.toString()) homeScore++;
       else if (event.team?.toString() === match.awayTeam.toString()) awayScore++;
-    } else if (event.eventType === 'Own Goal') {
+    } else if (type === 'Own Goal') {
       if (event.team?.toString() === match.homeTeam.toString()) awayScore++;
       else if (event.team?.toString() === match.awayTeam.toString()) homeScore++;
     }
@@ -27,7 +28,7 @@ const recalculateMatchScore = async (matchId) => {
 };
 
 const validateMatchEvent = async (body, matchId) => {
-  const { minute, team, player, assistPlayer, playerIn, playerOut } = body;
+  const { minute, team, player, assistPlayer, playerIn, playerOut, eventType } = body;
 
   // 1. Minute validation
   if (minute === undefined || minute === null || Number(minute) < 0) {
@@ -54,33 +55,40 @@ const validateMatchEvent = async (body, matchId) => {
     if (player) {
       const p = await Player.findById(player);
       if (!p) throw new Error('Player not found.');
-      if (p.team.toString() !== eventTeamId) {
+      if (p.team && p.team.toString() !== eventTeamId) {
         throw new Error(`Player ${p.displayName} does not belong to the selected team.`);
       }
     }
 
     if (assistPlayer) {
+      if (player && player.toString() === assistPlayer.toString()) {
+        throw new Error('Scorer and assist player cannot be the same player.');
+      }
       const ap = await Player.findById(assistPlayer);
       if (!ap) throw new Error('Assist player not found.');
-      if (ap.team.toString() !== eventTeamId) {
+      if (ap.team && ap.team.toString() !== eventTeamId) {
         throw new Error(`Assist player ${ap.displayName} does not belong to the selected team.`);
       }
     }
 
     // 4. Substitution player validation
-    if (playerOut) {
-      const pOut = await Player.findById(playerOut);
-      if (!pOut) throw new Error('Player Out not found.');
-      if (pOut.team.toString() !== eventTeamId) {
-        throw new Error(`Substitution player ${pOut.displayName} (Out) does not belong to the selected team.`);
+    if (eventType === 'Substitution' || playerOut || playerIn) {
+      if (playerOut && playerIn && playerOut.toString() === playerIn.toString()) {
+        throw new Error('Player entering and leaving pitch cannot be the same.');
       }
-    }
-
-    if (playerIn) {
-      const pIn = await Player.findById(playerIn);
-      if (!pIn) throw new Error('Player In not found.');
-      if (pIn.team.toString() !== eventTeamId) {
-        throw new Error(`Substitution player ${pIn.displayName} (In) does not belong to the selected team.`);
+      if (playerOut) {
+        const pOut = await Player.findById(playerOut);
+        if (!pOut) throw new Error('Player Out not found.');
+        if (pOut.team && pOut.team.toString() !== eventTeamId) {
+          throw new Error(`Substitution player ${pOut.displayName} (Out) does not belong to the selected team.`);
+        }
+      }
+      if (playerIn) {
+        const pIn = await Player.findById(playerIn);
+        if (!pIn) throw new Error('Player In not found.');
+        if (pIn.team && pIn.team.toString() !== eventTeamId) {
+          throw new Error(`Substitution player ${pIn.displayName} (In) does not belong to the selected team.`);
+        }
       }
     }
   }
@@ -89,9 +97,10 @@ const validateMatchEvent = async (body, matchId) => {
 // GET /api/match-events - List all match events with search, filter, pagination
 const getAllMatchEvents = async (req, res) => {
   try {
+    const isAll = req.query.limit === 'all' || req.query.all === 'true';
     const page = Number(req.query.page) || 1;
-    const limit = Number(req.query.limit) || 20;
-    const skip = (page - 1) * limit;
+    const limit = isAll ? 0 : (Number(req.query.limit) || 20);
+    const skip = isAll ? 0 : (page - 1) * limit;
 
     const query = {};
 
@@ -111,35 +120,40 @@ const getAllMatchEvents = async (req, res) => {
     }
 
     if (req.query.search) {
-      query.description = { $regex: req.query.search, $options: 'i' };
+      query.description = { $regex: req.query.search.trim(), $options: 'i' };
     }
 
     const count = await MatchEvent.countDocuments(query);
-    const events = await MatchEvent.find(query)
+    let eventsQuery = MatchEvent.find(query)
       .populate({
         path: 'match',
         populate: [
-          { path: 'homeTeam', select: 'name shortName' },
-          { path: 'awayTeam', select: 'name shortName' },
+          { path: 'homeTeam', select: 'name shortName logo' },
+          { path: 'awayTeam', select: 'name shortName logo' },
           { path: 'competition', select: 'name' }
         ]
       })
-      .populate('team', 'name shortName')
+      .populate('team', 'name shortName logo')
       .populate('player', 'displayName jerseyNumber position')
       .populate('assistPlayer', 'displayName jerseyNumber')
       .populate('playerIn', 'displayName jerseyNumber')
       .populate('playerOut', 'displayName jerseyNumber')
       .populate('createdBy', 'name email role')
-      .sort({ createdAt: -1 })
-      .skip(skip)
-      .limit(limit);
+      .sort({ createdAt: -1 });
+
+    if (!isAll && limit > 0) {
+      eventsQuery = eventsQuery.skip(skip).limit(limit);
+    }
+
+    const events = await eventsQuery;
 
     res.json({
+      success: true,
       events,
-      page,
-      limit,
+      page: isAll ? 1 : page,
+      limit: isAll ? count : limit,
       total: count,
-      pages: Math.ceil(count / limit)
+      pages: isAll ? 1 : (Math.ceil(count / limit) || 1)
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -153,12 +167,12 @@ const getMatchEventById = async (req, res) => {
       .populate({
         path: 'match',
         populate: [
-          { path: 'homeTeam', select: 'name shortName' },
-          { path: 'awayTeam', select: 'name shortName' },
+          { path: 'homeTeam', select: 'name shortName logo' },
+          { path: 'awayTeam', select: 'name shortName logo' },
           { path: 'competition', select: 'name' }
         ]
       })
-      .populate('team', 'name shortName')
+      .populate('team', 'name shortName logo')
       .populate('player', 'displayName jerseyNumber position')
       .populate('assistPlayer', 'displayName')
       .populate('playerIn', 'displayName jerseyNumber')
@@ -188,6 +202,17 @@ const createMatchEvent = async (req, res) => {
     const createdEvent = await event.save();
     await recalculateMatchScore(match);
 
+    // Create Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Created',
+        entityType: 'MatchEvent',
+        entityId: createdEvent._id,
+        newValue: { eventType: createdEvent.eventType, minute: createdEvent.minute, match: createdEvent.match }
+      });
+    }
+
     res.status(201).json(createdEvent);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -212,28 +237,30 @@ const updateMatchEvent = async (req, res) => {
     );
 
     // Create Audit Log for event correction
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Updated',
-      entityType: 'MatchEvent',
-      entityId: event._id,
-      oldValue: {
-        eventType: oldValues.eventType,
-        minute: oldValues.minute,
-        additionalMinute: oldValues.additionalMinute,
-        team: oldValues.team,
-        player: oldValues.player,
-        description: oldValues.description
-      },
-      newValue: {
-        eventType: updatedEvent.eventType,
-        minute: updatedEvent.minute,
-        additionalMinute: updatedEvent.additionalMinute,
-        team: updatedEvent.team,
-        player: updatedEvent.player,
-        description: updatedEvent.description
-      }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Updated',
+        entityType: 'MatchEvent',
+        entityId: event._id,
+        oldValue: {
+          eventType: oldValues.eventType,
+          minute: oldValues.minute,
+          additionalMinute: oldValues.additionalMinute,
+          team: oldValues.team,
+          player: oldValues.player,
+          description: oldValues.description
+        },
+        newValue: {
+          eventType: updatedEvent.eventType,
+          minute: updatedEvent.minute,
+          additionalMinute: updatedEvent.additionalMinute,
+          team: updatedEvent.team,
+          player: updatedEvent.player,
+          description: updatedEvent.description
+        }
+      });
+    }
 
     // Auto-update match score
     await recalculateMatchScore(matchId);
@@ -255,14 +282,16 @@ const verifyMatchEvent = async (req, res) => {
     await event.save();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Verified',
-      entityType: 'MatchEvent',
-      entityId: event._id,
-      oldValue: { verified: wasVerified },
-      newValue: { verified: true }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Verified',
+        entityType: 'MatchEvent',
+        entityId: event._id,
+        oldValue: { verified: wasVerified },
+        newValue: { verified: true }
+      });
+    }
 
     res.json({ message: 'Event verified successfully', event });
   } catch (error) {
@@ -282,14 +311,16 @@ const deleteMatchEvent = async (req, res) => {
     await event.deleteOne();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Deleted',
-      entityType: 'MatchEvent',
-      entityId: event._id,
-      oldValue: oldValues,
-      newValue: null
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Deleted',
+        entityType: 'MatchEvent',
+        entityId: event._id,
+        oldValue: oldValues,
+        newValue: null
+      });
+    }
 
     // Recalculate score
     await recalculateMatchScore(matchId);

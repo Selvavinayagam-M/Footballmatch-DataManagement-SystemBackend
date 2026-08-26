@@ -16,6 +16,13 @@ router.route('/')
   .get(protect, getSquads)
   .post(protect, authorize('admin', 'collector'), createSquad);
 
+router.post('/check', protect, authorize('admin', 'qa', 'collector'), (req, res, next) => {
+  if (!req.params.id && (req.body.squadId || req.query.squadId)) {
+    req.params.id = req.body.squadId || req.query.squadId;
+  }
+  return runSquadCheck(req, res, next);
+});
+
 router.route('/:id')
   .get(protect, getSquadById)
   .put(protect, authorize('admin', 'collector'), updateSquad)

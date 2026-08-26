@@ -1,8 +1,9 @@
 const Competition = require('../models/Competition');
 const Match = require('../models/Match');
 const Team = require('../models/Team');
+const AuditLog = require('../models/AuditLog');
 
-// @desc    Get all competitions
+// @desc    Get all competitions with pagination, search, filter, sort
 // @route   GET /api/competitions
 // @access  Private
 const getCompetitions = async (req, res) => {
@@ -13,10 +14,12 @@ const getCompetitions = async (req, res) => {
 
     let query = {};
     if (req.query.search) {
+      const searchRegex = new RegExp(req.query.search.trim(), 'i');
       query = {
         $or: [
-          { name: { $regex: req.query.search, $options: 'i' } },
-          { country: { $regex: req.query.search, $options: 'i' } }
+          { name: searchRegex },
+          { country: searchRegex },
+          { season: searchRegex }
         ]
       };
     }
@@ -39,9 +42,10 @@ const getCompetitions = async (req, res) => {
     const total = await Competition.countDocuments(query);
 
     res.json({
+      success: true,
       competitions,
       page,
-      pages: Math.ceil(total / limit),
+      pages: Math.ceil(total / limit) || 1,
       total
     });
   } catch (error) {
@@ -66,6 +70,7 @@ const getCompetition = async (req, res) => {
     const liveMatches = await Match.countDocuments({ competition: competition._id, status: 'Live' });
 
     res.json({
+      success: true,
       ...competition.toObject(),
       teamsCount,
       totalFixtures,
@@ -93,8 +98,42 @@ const createCompetition = async (req, res) => {
   }
   
   try {
-    const competition = new Competition({ name, country, season, startDate, endDate, status: status || 'Active', logo });
+    const trimmedName = name.trim();
+    const trimmedSeason = season.trim();
+
+    // Prevent duplicates with same name and season
+    const existing = await Competition.findOne({
+      name: { $regex: new RegExp(`^${trimmedName}$`, 'i') },
+      season: { $regex: new RegExp(`^${trimmedSeason}$`, 'i') }
+    });
+
+    if (existing) {
+      return res.status(400).json({ message: 'A competition with this name and season already exists' });
+    }
+
+    const competition = new Competition({
+      name: trimmedName,
+      country: country.trim(),
+      season: trimmedSeason,
+      startDate,
+      endDate,
+      status: status || 'Active',
+      logo
+    });
+
     const createdCompetition = await competition.save();
+
+    // Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Created',
+        entityType: 'Competition',
+        entityId: createdCompetition._id,
+        newValue: { name: createdCompetition.name, country: createdCompetition.country, season: createdCompetition.season }
+      });
+    }
+
     res.status(201).json(createdCompetition);
   } catch (error) {
     res.status(400).json({ message: error.message });
@@ -117,20 +156,49 @@ const updateCompetition = async (req, res) => {
 
   try {
     const competition = await Competition.findById(req.params.id);
-    if (competition) {
-      competition.name = name;
-      competition.country = country;
-      competition.season = season;
-      competition.startDate = startDate;
-      competition.endDate = endDate;
-      if (status) competition.status = status;
-      if (logo !== undefined) competition.logo = logo;
-      
-      const updatedCompetition = await competition.save();
-      res.json(updatedCompetition);
-    } else {
-      res.status(404).json({ message: 'Competition not found' });
+    if (!competition) {
+      return res.status(404).json({ message: 'Competition not found' });
     }
+
+    const trimmedName = name.trim();
+    const trimmedSeason = season.trim();
+
+    // Check duplicate name and season on other competitions
+    const duplicate = await Competition.findOne({
+      _id: { $ne: req.params.id },
+      name: { $regex: new RegExp(`^${trimmedName}$`, 'i') },
+      season: { $regex: new RegExp(`^${trimmedSeason}$`, 'i') }
+    });
+
+    if (duplicate) {
+      return res.status(400).json({ message: 'Another competition with this name and season already exists' });
+    }
+
+    const oldValue = competition.toObject();
+
+    competition.name = trimmedName;
+    competition.country = country.trim();
+    competition.season = trimmedSeason;
+    competition.startDate = startDate;
+    competition.endDate = endDate;
+    if (status) competition.status = status;
+    if (logo !== undefined) competition.logo = logo;
+    
+    const updatedCompetition = await competition.save();
+
+    // Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Updated',
+        entityType: 'Competition',
+        entityId: updatedCompetition._id,
+        oldValue: { name: oldValue.name, status: oldValue.status },
+        newValue: { name: updatedCompetition.name, status: updatedCompetition.status }
+      });
+    }
+
+    res.json(updatedCompetition);
   } catch (error) {
     res.status(400).json({ message: error.message });
   }
@@ -142,12 +210,35 @@ const updateCompetition = async (req, res) => {
 const deleteCompetition = async (req, res) => {
   try {
     const competition = await Competition.findById(req.params.id);
-    if (competition) {
-      await competition.deleteOne();
-      res.json({ message: 'Competition removed' });
-    } else {
-      res.status(404).json({ message: 'Competition not found' });
+    if (!competition) {
+      return res.status(404).json({ message: 'Competition not found' });
     }
+
+    // Check dependencies
+    const teamsCount = await Team.countDocuments({ competition: competition._id });
+    const matchesCount = await Match.countDocuments({ competition: competition._id });
+
+    if (teamsCount > 0 || matchesCount > 0) {
+      return res.status(400).json({
+        message: `Cannot delete competition. It is currently referenced by ${teamsCount} team(s) and ${matchesCount} match(es).`
+      });
+    }
+
+    const oldValue = competition.toObject();
+    await competition.deleteOne();
+
+    // Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Deleted',
+        entityType: 'Competition',
+        entityId: competition._id,
+        oldValue: { name: oldValue.name, country: oldValue.country, season: oldValue.season }
+      });
+    }
+
+    res.json({ message: 'Competition removed successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }

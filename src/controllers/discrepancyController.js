@@ -3,6 +3,7 @@ const Match = require('../models/Match');
 const Squad = require('../models/Squad');
 const MatchEvent = require('../models/MatchEvent');
 const Player = require('../models/Player');
+const Notification = require('../models/Notification');
 const AuditLog = require('../models/AuditLog');
 
 const getDiscrepancies = async (req, res) => {
@@ -44,13 +45,14 @@ const getDiscrepancies = async (req, res) => {
       .sort({ createdAt: -1 });
       
     res.json({
+      success: true,
       discrepancies,
       data: discrepancies, // backwards compatibility
       page,
       limit,
       total: count,
-      pages: Math.ceil(count / limit),
-      totalPages: Math.ceil(count / limit)
+      pages: Math.ceil(count / limit) || 1,
+      totalPages: Math.ceil(count / limit) || 1
     });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -81,7 +83,7 @@ const getDiscrepancy = async (req, res) => {
 
 const createDiscrepancy = async (req, res) => {
   try {
-    const { match, category, description, severity } = req.body;
+    const { match, category, description, severity, assignedTo } = req.body;
 
     if (!match || !category || !description || !severity) {
       return res.status(400).json({ message: 'Match, category, description, and severity are required.' });
@@ -111,19 +113,33 @@ const createDiscrepancy = async (req, res) => {
     const createdDiscrepancy = await discrepancy.save();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Created',
-      entityType: 'Discrepancy',
-      entityId: createdDiscrepancy._id,
-      oldValue: null,
-      newValue: {
-        category: createdDiscrepancy.category,
-        severity: createdDiscrepancy.severity,
-        description: createdDiscrepancy.description,
-        match: createdDiscrepancy.match
-      }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Created',
+        entityType: 'Discrepancy',
+        entityId: createdDiscrepancy._id,
+        oldValue: null,
+        newValue: {
+          category: createdDiscrepancy.category,
+          severity: createdDiscrepancy.severity,
+          description: createdDiscrepancy.description,
+          match: createdDiscrepancy.match
+        }
+      });
+    }
+
+    // Create Notification if assigned to someone
+    if (createdDiscrepancy.assignedTo) {
+      await Notification.create({
+        recipient: createdDiscrepancy.assignedTo,
+        type: 'Discrepancy Assigned',
+        title: 'Discrepancy Assigned',
+        message: `You have been assigned to investigate a ${createdDiscrepancy.severity} severity discrepancy: "${createdDiscrepancy.description}"`,
+        link: '/discrepancies',
+        metadata: { discrepancyId: createdDiscrepancy._id, matchId: createdDiscrepancy.match }
+      });
+    }
     
     // Update Match coverageStatus to 'Needs Review' if High or Critical
     if (severity === 'High' || severity === 'Critical') {
@@ -153,24 +169,38 @@ const updateDiscrepancy = async (req, res) => {
     const updatedDiscrepancy = await discrepancy.save();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: req.body.assignedTo && req.body.assignedTo !== oldValues.assignedTo?.toString() ? 'Assigned' : 'Updated',
-      entityType: 'Discrepancy',
-      entityId: discrepancy._id,
-      oldValue: {
-        assignedTo: oldValues.assignedTo,
-        status: oldValues.status,
-        severity: oldValues.severity,
-        description: oldValues.description
-      },
-      newValue: {
-        assignedTo: updatedDiscrepancy.assignedTo,
-        status: updatedDiscrepancy.status,
-        severity: updatedDiscrepancy.severity,
-        description: updatedDiscrepancy.description
-      }
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: req.body.assignedTo && req.body.assignedTo !== oldValues.assignedTo?.toString() ? 'Assigned' : 'Updated',
+        entityType: 'Discrepancy',
+        entityId: discrepancy._id,
+        oldValue: {
+          assignedTo: oldValues.assignedTo,
+          status: oldValues.status,
+          severity: oldValues.severity,
+          description: oldValues.description
+        },
+        newValue: {
+          assignedTo: updatedDiscrepancy.assignedTo,
+          status: updatedDiscrepancy.status,
+          severity: updatedDiscrepancy.severity,
+          description: updatedDiscrepancy.description
+        }
+      });
+    }
+
+    // Notification on reassignment
+    if (req.body.assignedTo && req.body.assignedTo !== oldValues.assignedTo?.toString()) {
+      await Notification.create({
+        recipient: req.body.assignedTo,
+        type: 'Discrepancy Assigned',
+        title: 'Discrepancy Assigned',
+        message: `You have been assigned to resolve a ${discrepancy.severity} severity discrepancy.`,
+        link: '/discrepancies',
+        metadata: { discrepancyId: discrepancy._id, matchId: discrepancy.match }
+      });
+    }
 
     res.json(updatedDiscrepancy);
   } catch (error) {
@@ -184,32 +214,46 @@ const resolveDiscrepancy = async (req, res) => {
     if (!discrepancy) return res.status(404).json({ message: 'Discrepancy not found' });
 
     const { status, resolution } = req.body;
-    if (!status || !['Resolved', 'Rejected'].includes(status)) {
-      return res.status(400).json({ message: 'Status must be either Resolved or Rejected.' });
+    if (!status || !['Resolved', 'Rejected', 'Open', 'In Review'].includes(status)) {
+      return res.status(400).json({ message: 'Status must be Resolved, Rejected, Open, or In Review.' });
     }
 
     const wasStatus = discrepancy.status;
     discrepancy.status = status;
-    discrepancy.resolution = resolution || (status === 'Resolved' ? 'Issue verified and corrected.' : 'Rejected after inspection.');
-    discrepancy.resolvedBy = req.user._id;
-    discrepancy.resolvedAt = new Date();
+    discrepancy.resolution = resolution || (status === 'Resolved' ? 'Issue verified and corrected.' : status === 'Rejected' ? 'Rejected after inspection.' : '');
+    discrepancy.resolvedBy = ['Resolved', 'Rejected'].includes(status) ? req.user._id : null;
+    discrepancy.resolvedAt = ['Resolved', 'Rejected'].includes(status) ? new Date() : null;
     
     const resolvedDiscrepancy = await discrepancy.save();
 
-    // Automatically create an Audit Log when resolved or rejected
-    await AuditLog.create({
-      user: req.user._id,
-      action: status === 'Resolved' ? 'Resolved' : 'Rejected',
-      entityType: 'Discrepancy',
-      entityId: discrepancy._id,
-      oldValue: { status: wasStatus, resolution: null },
-      newValue: {
-        status: resolvedDiscrepancy.status,
-        resolution: resolvedDiscrepancy.resolution,
-        resolvedBy: req.user._id,
-        resolvedAt: resolvedDiscrepancy.resolvedAt
-      }
-    });
+    // Create Audit Log
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: status === 'Resolved' ? 'Resolved' : status === 'Rejected' ? 'Rejected' : 'Updated',
+        entityType: 'Discrepancy',
+        entityId: discrepancy._id,
+        oldValue: { status: wasStatus, resolution: null },
+        newValue: {
+          status: resolvedDiscrepancy.status,
+          resolution: resolvedDiscrepancy.resolution,
+          resolvedBy: req.user._id,
+          resolvedAt: resolvedDiscrepancy.resolvedAt
+        }
+      });
+    }
+
+    // Notification to original reporter
+    if (discrepancy.reportedBy && discrepancy.reportedBy.toString() !== req.user._id.toString() && ['Resolved', 'Rejected'].includes(status)) {
+      await Notification.create({
+        recipient: discrepancy.reportedBy,
+        type: 'General',
+        title: `Discrepancy ${status}`,
+        message: `Discrepancy reported by you has been marked as ${status}. Resolution: ${discrepancy.resolution}`,
+        link: '/discrepancies',
+        metadata: { discrepancyId: discrepancy._id }
+      });
+    }
 
     // Check if remaining open issues on this match
     const remainingOpen = await Discrepancy.countDocuments({
@@ -240,14 +284,16 @@ const deleteDiscrepancy = async (req, res) => {
     await discrepancy.deleteOne();
 
     // Create Audit Log
-    await AuditLog.create({
-      user: req.user._id,
-      action: 'Deleted',
-      entityType: 'Discrepancy',
-      entityId: discrepancy._id,
-      oldValue: oldValues,
-      newValue: null
-    });
+    if (req.user) {
+      await AuditLog.create({
+        user: req.user._id,
+        action: 'Deleted',
+        entityType: 'Discrepancy',
+        entityId: discrepancy._id,
+        oldValue: oldValues,
+        newValue: null
+      });
+    }
 
     res.json({ message: 'Discrepancy deleted' });
   } catch (error) {
@@ -270,10 +316,11 @@ const scanMatchDataQuality = async (req, res) => {
     let computedAwayScore = 0;
 
     for (const ev of events) {
-      if (['Goal', 'Penalty'].includes(ev.eventType)) {
+      const type = ev.type || ev.eventType;
+      if (['Goal', 'Penalty'].includes(type)) {
         if (ev.team?.toString() === match.homeTeam._id.toString()) computedHomeScore++;
         else if (ev.team?.toString() === match.awayTeam._id.toString()) computedAwayScore++;
-      } else if (ev.eventType === 'Own Goal') {
+      } else if (type === 'Own Goal') {
         if (ev.team?.toString() === match.homeTeam._id.toString()) computedAwayScore++;
         else if (ev.team?.toString() === match.awayTeam._id.toString()) computedHomeScore++;
       }
